@@ -1,0 +1,120 @@
+name: Build daed ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-daed-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6.0.9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: wing/go.mod
+          cache-dependency-path: |
+            wing/go.sum
+            wing/dae-core/go.sum
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm curl file
+          go version
+          node --version
+          pnpm --version
+          clang --version
+
+      - name: Generate build metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+
+          DAED_SHA="$(git rev-parse HEAD)"
+          BUILD_VERSION="main-$(date -u +%Y%m%d)-${DAED_SHA:0:8}"
+
+          echo "version=$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+          echo "artifact=daed-linux-arm64-$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build static ARM64 bundle
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+          GOFLAGS: -trimpath -modcacherw
+          HUSKY: "0"
+          NODE_OPTIONS: --max-old-space-size=4096
+          BUILD_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist-arm64
+          make \
+            OUTPUT=dist-arm64/daed \
+            VERSION="$BUILD_VERSION"
+
+      - name: Validate and package
+        env:
+          BUILD_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          test -x dist-arm64/daed
+          file dist-arm64/daed | tee /tmp/daed-file.txt
+          grep -Eq 'ARM aarch64|aarch64' /tmp/daed-file.txt
+          grep -q 'statically linked' /tmp/daed-file.txt
+          go version -m dist-arm64/daed
+
+          curl --fail --location --retry 3 \
+            --output dist-arm64/geoip.dat \
+            https://raw.githubusercontent.com/v2rayA/dist-v2ray-rules-dat/master/geoip.dat
+
+          curl --fail --location --retry 3 \
+            --output dist-arm64/geosite.dat \
+            https://raw.githubusercontent.com/v2rayA/dist-v2ray-rules-dat/master/geosite.dat
+
+          {
+            echo "version=$BUILD_VERSION"
+            echo "daed_commit=$(git rev-parse HEAD)"
+            echo "dae_wing_commit=$(git -C wing rev-parse HEAD)"
+            echo "dae_commit=$(git -C wing/dae-core rev-parse HEAD)"
+            echo "build_time_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "go_version=$(go version)"
+            echo "node_version=$(node --version)"
+            echo "pnpm_version=$(pnpm --version)"
+            echo "clang_version=$(clang --version | head -n 1)"
+          } > dist-arm64/provenance.txt
+
+          cd dist-arm64
+          sha256sum daed geoip.dat geosite.dat > SHA256SUMS
+
+      - name: Upload ARM64 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.metadata.outputs.artifact }}
+          path: dist-arm64/
+          if-no-files-found: error
+          retention-days: 14
