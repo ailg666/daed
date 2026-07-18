@@ -8,6 +8,7 @@ import {
   LogOut,
   Menu,
   RefreshCw,
+  ScrollText,
   Terminal,
   UserPen,
   Wifi,
@@ -336,6 +337,12 @@ export function HeaderWithActions() {
             <DropdownMenuContent align="end" className="w-[200px]">
               <DropdownMenuLabel>{t('debug')}</DropdownMenuLabel>
               <DropdownMenuItem asChild>
+                <Link to="/logs">
+                  <ScrollText className="mr-2 h-4 w-4" />
+                  {t('logs.title')}
+                </Link>
+              </DropdownMenuItem>
+              <DropdownMenuItem asChild>
                 <Link to="/graphiql" target="_blank">
                   GraphiQL
                 </Link>
@@ -510,6 +517,12 @@ export function HeaderWithActions() {
               <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider px-2 py-1">
                 {t('debug')}
               </span>
+              <Link to="/logs" onClick={closeBurger}>
+                <Button variant="ghost" className="w-full justify-start gap-2 h-9 px-2">
+                  <ScrollText className="h-4 w-4" />
+                  <span className="text-sm">{t('logs.title')}</span>
+                </Button>
+              </Link>
               <Link to="/graphiql" target="_blank" onClick={closeBurger}>
                 <Button variant="ghost" className="w-full justify-start gap-2 h-9 px-2">
                   <Terminal className="h-4 w-4" />

@@ -9,6 +9,8 @@ import { version } from './package.json'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig(() => {
+  const appVersion = process.env.DAED_WEB_VERSION || version
+
   return {
     base: './',
     resolve: {
@@ -23,7 +25,7 @@ export default defineConfig(() => {
       chunkSizeWarningLimit: 10 * 1024 * 1024,
     },
     define: {
-      'import.meta.env.APP_VERSION': JSON.stringify(version),
+      'import.meta.env.APP_VERSION': JSON.stringify(appVersion),
     },
     test: { globals: true },
   }

@@ -1,0 +1,159 @@
+name: Build daed log viewer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat-web-log-viewer
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-daed-log-viewer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            label: linux-x86_64
+            file_pattern: x86-64|x86_64
+          - goarch: arm64
+            label: linux-arm64
+            file_pattern: ARM aarch64|aarch64
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply dae-wing log API patch
+        run: |
+          set -euo pipefail
+          git -C wing apply --check ../patches/wing-web-log-viewer.patch
+          git -C wing apply ../patches/wing-web-log-viewer.patch
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6.0.9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: wing/go.mod
+          cache-dependency-path: |
+            wing/go.sum
+            wing/dae-core/go.sum
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm file
+          go version
+          node --version
+          pnpm --version
+          clang --version
+
+      - name: Install web dependencies
+        env:
+          HUSKY: "0"
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Test log viewer changes
+        env:
+          HUSKY: "0"
+        run: |
+          set -euo pipefail
+          pnpm --filter daed test
+          pnpm --filter daed check-types
+          git diff --check
+          git -C wing diff --check
+          cd wing
+          go generate ./graphql/service/config/global
+          go test -tags=dae_stub_ebpf ./cmd
+
+      - name: Generate build metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:8}"
+          BUILD_VERSION="1.28.0-logviewer-${SHORT_SHA}"
+          OUTPUT_DIR="dist-${{ matrix.label }}"
+
+          echo "version=$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+          echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+          echo "artifact=daed-logviewer-${{ matrix.label }}-$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build static bundle
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          GOFLAGS: -trimpath -modcacherw
+          HUSKY: "0"
+          NODE_OPTIONS: --max-old-space-size=4096
+          BUILD_VERSION: ${{ steps.metadata.outputs.version }}
+          DAED_WEB_VERSION: ${{ steps.metadata.outputs.version }}
+          OUTPUT_DIR: ${{ steps.metadata.outputs.output_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GOARCH" == "amd64" ]]; then
+            export GOAMD64=v1
+          fi
+
+          mkdir -p "$OUTPUT_DIR"
+          make \
+            OUTPUT="$OUTPUT_DIR/daed" \
+            VERSION="$BUILD_VERSION"
+
+      - name: Validate artifact
+        env:
+          BUILD_VERSION: ${{ steps.metadata.outputs.version }}
+          OUTPUT_DIR: ${{ steps.metadata.outputs.output_dir }}
+          FILE_PATTERN: ${{ matrix.file_pattern }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$OUTPUT_DIR/daed"
+          file "$OUTPUT_DIR/daed" | tee /tmp/daed-file.txt
+          grep -Eq "$FILE_PATTERN" /tmp/daed-file.txt
+          grep -q "statically linked" /tmp/daed-file.txt
+          go version -m "$OUTPUT_DIR/daed"
+
+          {
+            echo "version=$BUILD_VERSION"
+            echo "daed_commit=$(git rev-parse HEAD)"
+            echo "dae_wing_base_commit=$(git -C wing rev-parse HEAD)"
+            echo "dae_commit=$(git -C wing/dae-core rev-parse HEAD)"
+            echo "build_time_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "go_version=$(go version)"
+            echo "node_version=$(node --version)"
+            echo "pnpm_version=$(pnpm --version)"
+          } > "$OUTPUT_DIR/provenance.txt"
+
+          cd "$OUTPUT_DIR"
+          sha256sum daed > SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.metadata.outputs.artifact }}
+          path: ${{ steps.metadata.outputs.output_dir }}/
+          if-no-files-found: error
+          retention-days: 14

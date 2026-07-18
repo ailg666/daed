@@ -1,0 +1,326 @@
+diff --git a/cmd/run.go b/cmd/run.go
+index 7dce577..65cdd14 100644
+--- a/cmd/run.go
++++ b/cmd/run.go
+@@ -122,6 +122,7 @@ var (
+ 			}
+ 			mux := http.NewServeMux()
+ 			mux.Handle("/graphql", auth(cors.AllowAll().Handler(&relay.Handler{Schema: schema})))
++			mux.Handle("/api/logs", cors.AllowAll().Handler(requireAdmin(logTailHandler(logFile))))
+ 			if err = webrender.Handle(mux); err != nil {
+ 				errorExit(err)
+ 			}
+@@ -211,37 +212,51 @@ func shouldReload() (ok bool, err error) {
+ 	return true, nil
+ }
+ 
++func authenticatedRequestContext(r *http.Request) context.Context {
++	authorization := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
++	var user db.User
++	token, err := jwt.Parse(authorization, func(token *jwt.Token) (interface{}, error) {
++		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
++			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
++		}
++		subject, err := token.Claims.GetSubject()
++		if err != nil {
++			return nil, err
++		}
++		q := db.DB(context.TODO()).Model(&db.User{}).Where("username = ?", subject).First(&user)
++		if q.Error != nil {
++			return nil, q.Error
++		}
++		if q.RowsAffected == 0 {
++			return nil, fmt.Errorf("no such user")
++		}
++		return []byte(user.JwtSecret), nil
++	})
++	ctx := r.Context()
++	if err == nil {
++		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
++			if expireAt, err := token.Claims.GetExpirationTime(); err == nil && time.Now().Before(expireAt.Time) {
++				ctx = context.WithValue(ctx, "role", claims["role"])
++				ctx = context.WithValue(ctx, "user", &user)
++			}
++		}
++	}
++	return ctx
++}
++
+ func auth(next http.Handler) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		authorization := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+-		var user db.User
+-		token, err := jwt.Parse(authorization, func(token *jwt.Token) (interface{}, error) {
+-			// Don't forget to validate the alg is what you expect:
+-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+-			}
+-			// Get corresponding secret.
+-			subject, err := token.Claims.GetSubject()
+-			if err != nil {
+-				return nil, err
+-			}
+-			q := db.DB(context.TODO()).Model(&db.User{}).Where("username = ?", subject).First(&user)
+-			if q.Error != nil {
+-				return nil, q.Error
+-			}
+-			if q.RowsAffected == 0 {
+-				return nil, fmt.Errorf("no such user")
+-			}
+-			return []byte(user.JwtSecret), nil
+-		})
+-		ctx := context.Background()
+-		if err == nil {
+-			if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+-				if expireAt, err := token.Claims.GetExpirationTime(); err == nil && time.Now().Before(expireAt.Time) {
+-					ctx = context.WithValue(ctx, "role", claims["role"])
+-					ctx = context.WithValue(ctx, "user", &user)
+-				}
+-			}
++		next.ServeHTTP(w, r.WithContext(authenticatedRequestContext(r)))
++	})
++}
++
++func requireAdmin(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		ctx := authenticatedRequestContext(r)
++		role, _ := ctx.Value("role").(string)
++		if !strings.EqualFold(role, "admin") {
++			http.Error(w, "unauthorized", http.StatusUnauthorized)
++			return
+ 		}
+ 		next.ServeHTTP(w, r.WithContext(ctx))
+ 	})
+
+diff --git a/cmd/logs.go b/cmd/logs.go
+new file mode 100644
+index 0000000..13cf312
+--- /dev/null
++++ b/cmd/logs.go
+@@ -0,0 +1,135 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2023, daeuniverse Organization <team@v2raya.org>
++ */
++
++package cmd
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	defaultLogTailLines = 500
++	maxLogTailLines     = 5000
++	maxLogTailBytes     = 4 << 20
++)
++
++type logTailResponse struct {
++	Content    string `json:"content"`
++	Path       string `json:"path"`
++	Size       int64  `json:"size"`
++	ModifiedAt string `json:"modifiedAt"`
++	Truncated  bool   `json:"truncated"`
++}
++
++func logTailHandler(logPath string) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodGet {
++			w.Header().Set("Allow", http.MethodGet)
++			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++			return
++		}
++		if strings.TrimSpace(logPath) == "" {
++			http.Error(w, "log file is not configured", http.StatusServiceUnavailable)
++			return
++		}
++
++		lineLimit, err := parseLogTailLines(r.URL.Query().Get("tail"))
++		if err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		response, err := readLogTail(logPath, lineLimit)
++		if err != nil {
++			if errors.Is(err, os.ErrNotExist) {
++				http.Error(w, "log file does not exist", http.StatusNotFound)
++				return
++			}
++			http.Error(w, "failed to read log file", http.StatusInternalServerError)
++			return
++		}
++
++		w.Header().Set("Cache-Control", "no-store")
++		w.Header().Set("Content-Type", "application/json; charset=utf-8")
++		if err := json.NewEncoder(w).Encode(response); err != nil {
++			return
++		}
++	})
++}
++
++func parseLogTailLines(raw string) (int, error) {
++	if raw == "" {
++		return defaultLogTailLines, nil
++	}
++	lineLimit, err := strconv.Atoi(raw)
++	if err != nil || lineLimit < 1 || lineLimit > maxLogTailLines {
++		return 0, errors.New("tail must be an integer between 1 and 5000")
++	}
++	return lineLimit, nil
++}
++
++func readLogTail(logPath string, lineLimit int) (logTailResponse, error) {
++	file, err := os.Open(logPath)
++	if err != nil {
++		return logTailResponse{}, err
++	}
++	defer file.Close()
++
++	info, err := file.Stat()
++	if err != nil {
++		return logTailResponse{}, err
++	}
++
++	start := info.Size() - maxLogTailBytes
++	if start < 0 {
++		start = 0
++	}
++	if _, err := file.Seek(start, io.SeekStart); err != nil {
++		return logTailResponse{}, err
++	}
++	data, err := io.ReadAll(io.LimitReader(file, maxLogTailBytes))
++	if err != nil {
++		return logTailResponse{}, err
++	}
++
++	truncated := start > 0
++	content := string(data)
++	if start > 0 {
++		if newline := strings.IndexByte(content, '\n'); newline >= 0 {
++			content = content[newline+1:]
++		} else {
++			content = ""
++		}
++	}
++
++	hasTrailingNewline := strings.HasSuffix(content, "\n")
++	content = strings.TrimSuffix(content, "\n")
++	var lines []string
++	if content != "" {
++		lines = strings.Split(content, "\n")
++	}
++	if len(lines) > lineLimit {
++		lines = lines[len(lines)-lineLimit:]
++		truncated = true
++	}
++	content = strings.Join(lines, "\n")
++	if hasTrailingNewline && content != "" {
++		content += "\n"
++	}
++
++	return logTailResponse{
++		Content:    content,
++		Path:       logPath,
++		Size:       info.Size(),
++		ModifiedAt: info.ModTime().UTC().Format(time.RFC3339),
++		Truncated:  truncated,
++	}, nil
++}
+
+diff --git a/cmd/logs_test.go b/cmd/logs_test.go
+new file mode 100644
+index 0000000..e5ce290
+--- /dev/null
++++ b/cmd/logs_test.go
+@@ -0,0 +1,84 @@
++/*
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * Copyright (c) 2023, daeuniverse Organization <team@v2raya.org>
++ */
++
++package cmd
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestParseLogTailLines(t *testing.T) {
++	tests := []struct {
++		name    string
++		raw     string
++		want    int
++		wantErr bool
++	}{
++		{name: "default", want: defaultLogTailLines},
++		{name: "valid", raw: "1200", want: 1200},
++		{name: "zero", raw: "0", wantErr: true},
++		{name: "too large", raw: "5001", wantErr: true},
++		{name: "not a number", raw: "many", wantErr: true},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := parseLogTailLines(tt.raw)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("parseLogTailLines() error = %v, wantErr %v", err, tt.wantErr)
++			}
++			if got != tt.want {
++				t.Fatalf("parseLogTailLines() = %d, want %d", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestReadLogTail(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "daed.log")
++	if err := os.WriteFile(path, []byte("first\nsecond\nthird\nfourth\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	result, err := readLogTail(path, 2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if result.Content != "third\nfourth\n" {
++		t.Fatalf("unexpected content %q", result.Content)
++	}
++	if !result.Truncated {
++		t.Fatal("expected truncated response")
++	}
++	if result.Path != path {
++		t.Fatalf("path = %q, want %q", result.Path, path)
++	}
++}
++
++func TestLogTailHandler(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "daed.log")
++	if err := os.WriteFile(path, []byte("first\nsecond\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	recorder := httptest.NewRecorder()
++	request := httptest.NewRequest(http.MethodGet, "/api/logs?tail=1", nil)
++	logTailHandler(path).ServeHTTP(recorder, request)
++
++	if recorder.Code != http.StatusOK {
++		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
++	}
++	var response logTailResponse
++	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
++		t.Fatal(err)
++	}
++	if response.Content != "second\n" {
++		t.Fatalf("content = %q, want %q", response.Content, "second\n")
++	}
++}
