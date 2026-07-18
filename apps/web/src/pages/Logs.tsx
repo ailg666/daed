@@ -1,15 +1,17 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
-import { Download, RefreshCw, ScrollText } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { Download, RefreshCw, ScrollText, Search, X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { fetchLogTail } from '~/apis'
 import { Badge } from '~/components/ui/badge'
 import { Button } from '~/components/ui/button'
 import { Card } from '~/components/ui/card'
+import { Input } from '~/components/ui/input'
 import { Switch } from '~/components/ui/switch'
 import { endpointURLAtom, tokenAtom } from '~/store'
+import { searchLogLines } from '~/utils/logSearch'
 
 const lineOptions = [200, 500, 1000, 2000, 5000]
 
@@ -31,6 +33,9 @@ export function LogsPage() {
   const [tail, setTail] = useState(500)
   const [liveRefresh, setLiveRefresh] = useState(true)
   const [autoScroll, setAutoScroll] = useState(true)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [regexMode, setRegexMode] = useState(false)
+  const [caseSensitive, setCaseSensitive] = useState(false)
 
   const logsQuery = useQuery({
     queryKey: ['logs', endpointURL, tail],
@@ -40,20 +45,26 @@ export function LogsPage() {
     refetchIntervalInBackground: true,
   })
 
+  const searchResult = useMemo(
+    () => searchLogLines(logsQuery.data?.content ?? '', searchQuery, regexMode, caseSensitive),
+    [caseSensitive, logsQuery.data?.content, regexMode, searchQuery],
+  )
+  const displayedContent = searchResult.error ? logsQuery.data?.content ?? '' : searchResult.content
+
   useEffect(() => {
-    if (!autoScroll || !logsQuery.data?.content || !logContainerRef.current) return
+    if (!autoScroll || !displayedContent || !logContainerRef.current) return
 
     logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight
-  }, [autoScroll, logsQuery.data?.content])
+  }, [autoScroll, displayedContent])
 
   const downloadLogs = () => {
-    if (!logsQuery.data?.content) return
+    if (!displayedContent) return
 
-    const blob = new Blob([logsQuery.data.content], { type: 'text/plain;charset=utf-8' })
+    const blob = new Blob([displayedContent], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
-    anchor.download = 'daed.log'
+    anchor.download = searchResult.active ? 'daed-filtered.log' : 'daed.log'
     anchor.click()
     URL.revokeObjectURL(url)
   }
@@ -113,11 +124,47 @@ export function LogsPage() {
               <RefreshCw />
               {t('actions.refresh')}
             </Button>
-            <Button variant="outline" size="sm" disabled={!logsQuery.data?.content} onClick={downloadLogs}>
+            <Button variant="outline" size="sm" disabled={!displayedContent} onClick={downloadLogs}>
               <Download />
               {t('logs.download')}
             </Button>
           </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 border-b p-4">
+          <Input
+            wrapperClassName="min-w-[16rem] flex-1"
+            icon={<Search className="h-4 w-4" />}
+            value={searchQuery}
+            placeholder={t('logs.searchPlaceholder')}
+            aria-label={t('logs.search')}
+            onChange={(event) => setSearchQuery(event.target.value)}
+          />
+          <label className="flex items-center gap-2 text-sm">
+            <Switch size="sm" checked={regexMode} onCheckedChange={setRegexMode} />
+            <span>{t('logs.regex')}</span>
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <Switch size="sm" checked={caseSensitive} onCheckedChange={setCaseSensitive} />
+            <span>{t('logs.caseSensitive')}</span>
+          </label>
+          {searchResult.active && !searchResult.error && (
+            <Badge variant="secondary">{t('logs.matchCount', { count: searchResult.matchCount })}</Badge>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={!searchQuery}
+            onClick={() => setSearchQuery('')}
+          >
+            <X />
+            {t('logs.clearSearch')}
+          </Button>
+          {searchResult.error && (
+            <p className="basis-full text-sm text-destructive">
+              {t('logs.invalidRegex')}: {searchResult.error}
+            </p>
+          )}
         </div>
 
         <div className="grid gap-2 border-b bg-muted/30 px-4 py-3 text-xs text-muted-foreground sm:grid-cols-3">
@@ -140,14 +187,16 @@ export function LogsPage() {
 
         <div
           ref={logContainerRef}
-          className="h-[calc(100vh-19rem)] min-h-[28rem] overflow-auto bg-zinc-950 p-4 font-mono text-xs leading-5 text-zinc-100"
+          className="h-[calc(100vh-24rem)] min-h-[24rem] overflow-auto bg-zinc-950 p-4 font-mono text-xs leading-5 text-zinc-100"
         >
           {logsQuery.isError ? (
             <div className="whitespace-pre-wrap text-red-400">
               {t('logs.loadError')}: {logsQuery.error.message}
             </div>
           ) : (
-            <pre className="min-w-max whitespace-pre">{logsQuery.data?.content || t('logs.empty')}</pre>
+            <pre className="min-w-max whitespace-pre">
+              {displayedContent || (searchResult.active ? t('logs.noMatches') : t('logs.empty'))}
+            </pre>
           )}
         </div>
       </Card>

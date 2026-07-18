@@ -335,7 +335,15 @@
     "modifiedAt": "Modified",
     "truncated": "Tail only",
     "loadError": "Failed to load logs",
-    "empty": "No log entries"
+    "empty": "No log entries",
+    "search": "Search logs",
+    "searchPlaceholder": "Keyword or regular expression",
+    "regex": "Regular expression",
+    "caseSensitive": "Case sensitive",
+    "matchCount": "{{count}} matching lines",
+    "clearSearch": "Clear",
+    "invalidRegex": "Invalid regular expression",
+    "noMatches": "No matching log entries"
   },
   "success": "Success",
   "tag": "Tag",

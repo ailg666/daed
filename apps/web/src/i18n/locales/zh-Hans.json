@@ -335,7 +335,15 @@
     "modifiedAt": "更新时间",
     "truncated": "仅显示末尾",
     "loadError": "日志加载失败",
-    "empty": "暂无日志"
+    "empty": "暂无日志",
+    "search": "查找日志",
+    "searchPlaceholder": "输入关键字或正则表达式",
+    "regex": "正则表达式",
+    "caseSensitive": "区分大小写",
+    "matchCount": "匹配 {{count}} 行",
+    "clearSearch": "清除",
+    "invalidRegex": "正则表达式无效",
+    "noMatches": "没有匹配的日志"
   },
   "success": "成功",
   "tag": "标签",
