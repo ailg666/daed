@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           pnpm --filter daed test
-          pnpm --filter daed check-types
+          pnpm check-types
           git diff --check
           git -C wing diff --check
           cd wing
